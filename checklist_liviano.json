@@ -1,0 +1,7 @@
+[
+ {"group":"Niveles","items":["Líquido refrigerante de radiador","Líquido de frenos","Aceite de motor","Nivel de líquido hidráulico","Agua del limpiavidrios"]},
+ {"group":"Pedales","items":["Acelerador","Embrague","Freno"]},
+ {"group":"Luces","items":["Luces altas, medias y bajas","Direccionales","Estacionarias","Stops (frenos)","Testigos del tablero","Luz de reversa","Luces internas"]},
+ {"group":"Equipo de carretera y botiquín","items":["Extintor (20 lb - PQS)","Fecha de vencimiento del extintor","Llanta de repuesto","Llave de ruedas","Señalética: conos o triángulos reflectivos","Dos tacos","Caja de herramientas","Linterna","Gata","Botiquín de primeros auxilios"]},
+ {"group":"Varios","items":["Llantas","Batería","Rines","Cinturones de seguridad","Pito de reversa","Pito","Freno de emergencia","Espejos laterales y cabina","Estado de carcasa de luces","Plumas / limpiaparabrisas","Tapizado","Parabrisas panorámico"]}
+]

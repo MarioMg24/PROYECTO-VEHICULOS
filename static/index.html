@@ -1,0 +1,56 @@
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="theme-color" content="#12263d">
+<meta name="description" content="Registro de inspecciones, mantenimientos y bodega vehicular de Gold Engine.">
+<link rel="manifest" href="/manifest.webmanifest">
+<link rel="icon" type="image/png" href="/static/icons/icon-192.png">
+<link rel="apple-touch-icon" href="/static/icons/icon-192.png">
+<link rel="stylesheet" href="/static/app.css">
+<title>Gold Engine Fleet</title>
+</head>
+<body>
+<div id="app">
+<aside class="sidebar">
+  <a href="#inicio" class="brand" data-nav="inicio"><span class="brand-icon">G<span>F</span></span><span><strong>GOLD ENGINE</strong><small>FLEET · MANTENIMIENTO</small></span></a>
+  <div class="nav-title">OPERACIONES</div>
+  <button data-nav="inicio" class="nav-item active"><span class="nav-ico">▦</span> Panel general</button>
+  <button data-nav="vehiculos" class="nav-item"><span class="nav-ico">▤</span> Vehículos</button>
+  <button data-nav="inspecciones" class="nav-item"><span class="nav-ico">☑</span> Inspecciones</button>
+  <button data-nav="mantenimientos" class="nav-item"><span class="nav-ico">⚙</span> Mantenimientos</button>
+  <div class="nav-title">BODEGA VEHICULAR</div>
+  <button data-nav="repuestos" class="nav-item"><span class="nav-ico">▧</span> Repuestos</button>
+  <button data-nav="solicitudes" class="nav-item"><span class="nav-ico">☷</span> Solicitudes</button>
+  <button data-nav="historial" class="nav-item"><span class="nav-ico">⇄</span> Historial / Exportar</button>
+  <div class="nav-spacer"></div>
+  <div class="sidebar-footer"><span class="pulse"></span><div><b>Modo local</b><small>Primera versión · PWA</small></div></div>
+</aside>
+<div class="workarea">
+  <header class="topbar">
+    <div><div class="crumb">GOLD ENGINE / <span id="crumb">INICIO</span></div><h1 id="page-title">Panel general</h1><p id="page-sub">Control de flota, inspecciones y bodega vehicular.</p></div>
+    <div class="header-right"><span id="network-status" class="status ok">● Conectado</span><span class="prototype">VERSIÓN PILOTO</span></div>
+  </header>
+  <div id="alert" class="alert hidden" role="status"></div>
+  <main id="screen" class="screen" aria-live="polite"></main>
+  <footer class="footer">Gold Engine Fleet · Proyecto piloto local · Los datos reales deben validarse antes del uso oficial.</footer>
+</div>
+<nav class="mobile-nav" aria-label="Navegación móvil">
+ <button data-nav="inicio"><span>▦</span>Inicio</button>
+ <button data-nav="vehiculos"><span>▤</span>Flota</button>
+ <button data-nav="inspecciones"><span>☑</span>Check</button>
+ <button data-nav="repuestos"><span>▧</span>Bodega</button>
+ <button data-nav="solicitudes"><span>☷</span>Pedidos</button>
+ <button data-mobile-menu="1"><span>☰</span>Más</button>
+</nav>
+<div class="modal-backdrop hidden" id="modal-backdrop">
+  <div class="modal" role="dialog" aria-modal="true" aria-labelledby="modal-title">
+    <header class="modal-header"><h2 id="modal-title">Nuevo registro</h2><button type="button" id="modal-close" class="icon-button" aria-label="Cerrar">✕</button></header>
+    <div id="modal-content"></div>
+  </div>
+</div>
+</div>
+<script defer src="/static/app.js"></script>
+</body>
+</html>
