@@ -9,6 +9,7 @@ from contextlib import contextmanager
 from datetime import datetime, date
 from decimal import Decimal, InvalidOperation
 from io import BytesIO, StringIO
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -18,7 +19,7 @@ from tempfile import TemporaryDirectory
 from typing import Any
 from uuid import uuid4
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
@@ -28,6 +29,11 @@ DATA = ROOT / 'data'
 DB = Path(os.environ.get('GEFLEET_DB', str(DATA / 'fleet.db'))).resolve()
 TEMPLATE = json.loads((ROOT / 'checklist_liviano.json').read_text(encoding='utf-8'))
 CHECK_IDS = {f'{gi}-{ii}' for gi, g in enumerate(TEMPLATE) for ii, _ in enumerate(g['items'])}
+SCHEMA_VERSION = 1
+MAX_ODOMETER_KM = 10_000_000
+MAX_SERVICE_INTERVAL_KM = 1_000_000
+MAX_EXPECTED_ODOMETER_KM = 9_007_199_254_740_991
+ODOMETER_CORRECTION_SERVICE = 'Corrección de kilometraje'
 
 app = FastAPI(title='Gold Engine Fleet', docs_url='/api/docs', redoc_url=None)
 app.mount('/static', StaticFiles(directory=str(ROOT / 'static')), name='static')
@@ -53,6 +59,8 @@ def connect():
 
 def init_db():
     with connect() as cn:
+        if cn.execute('PRAGMA user_version').fetchone()[0] > SCHEMA_VERSION:
+            raise RuntimeError('La base de datos utiliza una versión de esquema más reciente que esta aplicación.')
         cn.executescript('''
 CREATE TABLE IF NOT EXISTS vehicles (
  id INTEGER PRIMARY KEY, plate TEXT UNIQUE NOT NULL, name TEXT NOT NULL,
@@ -106,6 +114,23 @@ CREATE TABLE IF NOT EXISTS request_lines (
  delivered_milli INTEGER NOT NULL DEFAULT 0 CHECK(delivered_milli >= 0 AND delivered_milli <= qty_milli)
 );
 ''')
+        # executescript commits implicitly. Start the additive migration separately
+        # so the table and its schema version are either both committed or neither.
+        cn.execute('BEGIN IMMEDIATE')
+        try:
+            if cn.execute('PRAGMA user_version').fetchone()[0] < 1:
+                cn.execute('''CREATE TABLE inventory_operations (
+                    operation_key TEXT PRIMARY KEY NOT NULL CHECK(length(operation_key) BETWEEN 1 AND 128),
+                    scope TEXT NOT NULL,
+                    request_hash TEXT NOT NULL,
+                    response_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                )''')
+                cn.execute('PRAGMA user_version=1')
+            cn.execute('COMMIT')
+        except Exception:
+            cn.execute('ROLLBACK')
+            raise
 
 
 @app.on_event('startup')
@@ -165,6 +190,51 @@ def get_vehicle(cn, vehicle_id):
     return v
 
 
+def service_key(name: str) -> str:
+    return ' '.join(name.split()).casefold()
+
+
+def service_date(value: str) -> str:
+    value = value.strip()
+    try:
+        if not re.fullmatch(r'[0-9]{4}-[0-9]{2}-[0-9]{2}', value):
+            raise ValueError()
+        return date.fromisoformat(value).isoformat()
+    except ValueError:
+        raise HTTPException(422, 'Fecha inválida: usa una fecha existente con formato AAAA-MM-DD.')
+
+
+def current_maintenance_plans(cn):
+    # History is paginated independently. A service entered late must not replace
+    # a more recent effective service, and corrective work cannot reset a plan.
+    selected = {}
+    ranks = {}
+    for row in cn.execute('''SELECT m.*,v.name AS vehicle_name,v.plate
+            FROM maintenance m JOIN vehicles v ON v.id=m.vehicle_id
+            WHERE m.interval_km>0'''):
+        record = dict(row)
+        try:
+            performed_on = service_date(record['performed_on'])
+        except HTTPException:
+            # Invalid legacy dates remain available in the history/export.
+            continue
+        odometer, interval = record['odometer'], record['interval_km']
+        if (not isinstance(odometer, int) or not 0 <= odometer <= MAX_ODOMETER_KM
+                or not isinstance(interval, int) or not 1 <= interval <= MAX_SERVICE_INTERVAL_KM):
+            continue
+        normalized_name = service_key(record['service_name'])
+        if not normalized_name or normalized_name == service_key(ODOMETER_CORRECTION_SERVICE):
+            continue
+        key = (record['vehicle_id'], normalized_name)
+        rank = (performed_on, odometer, record['id'])
+        if key not in ranks or rank > ranks[key]:
+            record['performed_on'] = performed_on
+            record['service_key'] = normalized_name
+            record['next_due_km'] = odometer + interval
+            selected[key], ranks[key] = record, rank
+    return [selected[key] for key in sorted(selected)]
+
+
 @app.get('/')
 def index():
     return HTMLResponse((ROOT / 'static' / 'index.html').read_text(encoding='utf-8'))
@@ -191,10 +261,12 @@ def bootstrap():
         inspection = [dict(r) for r in cn.execute('''SELECT i.id,i.client_uuid,i.date,i.inspector,i.odometer,i.vehicle_id,i.failure_count,i.observations,i.created_at,v.plate,v.name AS vehicle_name
             FROM inspections i JOIN vehicles v ON v.id=i.vehicle_id ORDER BY i.id DESC LIMIT 200''')]
         maintenance = [dict(r) for r in cn.execute('''SELECT m.*,v.name AS vehicle_name,v.plate FROM maintenance m JOIN vehicles v ON v.id=m.vehicle_id ORDER BY m.id DESC LIMIT 200''')]
+        maintenance_plans = current_maintenance_plans(cn)
         requests = [dict(r) for r in cn.execute('''SELECT q.*,v.plate,v.name AS vehicle_name FROM requests q JOIN vehicles v ON v.id=q.vehicle_id ORDER BY q.id DESC LIMIT 200''')]
         movements = [dict(r) for r in cn.execute('''SELECT m.*,p.code,p.name AS part_name,p.unit,v.plate FROM movements m JOIN parts p ON p.id=m.part_id LEFT JOIN vehicles v ON v.id=m.vehicle_id ORDER BY m.id DESC LIMIT 200''')]
         lines = [dict(r) for r in cn.execute('SELECT * FROM request_lines')]
     return {'vehicles': vehicles, 'parts': parts,'compatibility':compat,'inspections':inspection,'maintenance':maintenance,
+            'maintenance_plans':maintenance_plans,
             'requests': requests, 'request_lines':lines,'movements':movements,'template': TEMPLATE,
             'prototype':True}
 
@@ -205,7 +277,7 @@ class VehicleIn(BaseModel):
     vehicle_type: str = 'LIVIANO'
     brand: str = ''
     model: str = ''
-    odometer: int = Field(default=0, ge=0)
+    odometer: int = Field(default=0, strict=True, ge=0, le=MAX_ODOMETER_KM)
     notes: str = ''
 
 
@@ -222,16 +294,91 @@ def create_vehicle(v: VehicleIn):
         raise HTTPException(409,'Ya existe un vehículo con esa placa.')
 
 
+class VehiclePatchIn(BaseModel):
+    model_config = {'extra': 'forbid'}
+    plate: str | None = None
+    name: str | None = None
+    vehicle_type: str | None = None
+    brand: str | None = None
+    model: str | None = None
+    odometer: int | None = Field(default=None, strict=True, ge=0, le=MAX_ODOMETER_KM)
+    notes: str | None = None
+    expected_odometer: int | None = Field(default=None, strict=True, ge=0, le=MAX_EXPECTED_ODOMETER_KM)
+
+
 @app.patch('/api/vehicles/{vehicle_id}')
-def patch_vehicle(vehicle_id:int,v: VehicleIn):
-    try:
-        with connect() as cn:
-            get_vehicle(cn,vehicle_id)
-            cn.execute('UPDATE vehicles SET plate=?,name=?,vehicle_type=?,brand=?,model=?,odometer=?,notes=? WHERE id=?',
-                (required(v.plate,'Placa').upper(),required(v.name,'Nombre'),required(v.vehicle_type,'Tipo'),v.brand.strip(),v.model.strip(),v.odometer,v.notes.strip(),vehicle_id))
-        return {'ok':True}
-    except sqlite3.IntegrityError:
-        raise HTTPException(409,'La placa ya está registrada.')
+def patch_vehicle(vehicle_id:int,v: VehiclePatchIn):
+    changes = v.model_dump(exclude_unset=True)
+    if any(value is None for value in changes.values()):
+        raise HTTPException(422, 'Los campos de una edición no pueden ser nulos; omite los que no deseas modificar.')
+    expected_odometer = changes.pop('expected_odometer', None)
+    labels = {'plate': 'Placa', 'name': 'Nombre', 'vehicle_type': 'Tipo'}
+    for field in tuple(changes):
+        if field in labels:
+            changes[field] = required(changes[field], labels[field])
+            if field == 'plate':
+                changes[field] = changes[field].upper()
+        elif isinstance(changes[field], str):
+            changes[field] = changes[field].strip()
+    with connect() as cn:
+        cn.execute('BEGIN IMMEDIATE')
+        try:
+            vehicle = get_vehicle(cn,vehicle_id)
+            if expected_odometer is not None and expected_odometer != vehicle['odometer']:
+                raise HTTPException(409, 'El kilometraje cambió desde que abriste el formulario. Actualiza los datos y revisa la lectura antes de guardar.')
+            if 'odometer' in changes and changes['odometer'] < vehicle['odometer']:
+                raise HTTPException(409, 'La edición normal no puede reducir el kilometraje actual. Usa la acción explícita de corrección e indica el motivo y responsable.')
+            if changes:
+                # Column names come exclusively from the validated patch model.
+                columns = ','.join(f'{field}=?' for field in changes)
+                cn.execute(f'UPDATE vehicles SET {columns} WHERE id=?', (*changes.values(), vehicle_id))
+            cn.execute('COMMIT')
+            return {'ok':True, 'odometer':changes.get('odometer', vehicle['odometer'])}
+        except sqlite3.IntegrityError:
+            cn.execute('ROLLBACK')
+            raise HTTPException(409,'La placa ya está registrada.')
+        except Exception:
+            cn.execute('ROLLBACK')
+            raise
+
+
+class OdometerCorrectionIn(BaseModel):
+    model_config = {'extra': 'forbid'}
+    odometer: int = Field(strict=True, ge=0, le=MAX_ODOMETER_KM)
+    expected_odometer: int = Field(strict=True, ge=0, le=MAX_EXPECTED_ODOMETER_KM)
+    reason: str
+    responsible: str
+    corrected_on: str
+
+
+@app.post('/api/vehicles/{vehicle_id}/odometer-correction')
+def correct_odometer(vehicle_id: int, payload: OdometerCorrectionIn):
+    reason = required(payload.reason, 'Motivo de la corrección', 500)
+    responsible = required(payload.responsible, 'Responsable de la corrección', 100)
+    corrected_on = service_date(payload.corrected_on)
+    with connect() as cn:
+        cn.execute('BEGIN IMMEDIATE')
+        try:
+            vehicle = get_vehicle(cn, vehicle_id)
+            if vehicle['odometer'] != payload.expected_odometer:
+                raise HTTPException(409, 'El kilometraje cambió desde que abriste la corrección. Actualiza los datos y revisa la lectura antes de guardar.')
+            if vehicle['odometer'] == payload.odometer:
+                raise HTTPException(422, 'La lectura corregida debe ser diferente de la lectura actual.')
+            notes = (f"Lectura anterior: {vehicle['odometer']} km.\n"
+                     f'Lectura corregida: {payload.odometer} km.\n'
+                     f'Responsable: {responsible}\nMotivo: {reason}')
+            # Append an audit event in existing history; never rewrite previous
+            # readings or create a preventive plan from an odometer correction.
+            cur = cn.execute('''INSERT INTO maintenance
+                (vehicle_id,service_name,performed_on,odometer,interval_km,next_due_km,notes)
+                VALUES(?,?,?,?,NULL,NULL,?)''', (vehicle_id, ODOMETER_CORRECTION_SERVICE,
+                    corrected_on, payload.odometer, notes))
+            cn.execute('UPDATE vehicles SET odometer=? WHERE id=?', (payload.odometer, vehicle_id))
+            cn.execute('COMMIT')
+            return {'ok':True, 'id':cur.lastrowid, 'odometer':payload.odometer}
+        except Exception:
+            cn.execute('ROLLBACK')
+            raise
 
 
 class InspectionIn(BaseModel):
@@ -256,6 +403,8 @@ def save_inspection(payload: InspectionIn):
         date.fromisoformat(payload.date)
     except ValueError:
         raise HTTPException(422,'Fecha inválida.')
+    if len(payload.observations) > 2500:
+        raise HTTPException(422,'Las observaciones y notas del checklist no pueden superar 2500 caracteres. Reduce el texto antes de finalizar; no se ha guardado la inspección.')
     if len(payload.photos)>3:
         raise HTTPException(422,'Máximo tres fotografías JPEG reducidas de tamaño.')
     for photo in payload.photos:
@@ -279,7 +428,7 @@ def save_inspection(payload: InspectionIn):
                 raise HTTPException(422,'El checklist disponible actualmente corresponde solo a vehículos livianos.')
             cur=cn.execute('''INSERT INTO inspections(client_uuid,vehicle_id,date,inspector,odometer,answers_json,observations,photos_json,failure_count)
                 VALUES(?,?,?,?,?,?,?,?,?)''',(uid,payload.vehicle_id,payload.date,required(payload.inspector,'Inspector'),payload.odometer,
-                json.dumps(payload.answers,ensure_ascii=False),payload.observations.strip()[:2500],json.dumps(payload.photos),
+                json.dumps(payload.answers,ensure_ascii=False),payload.observations,json.dumps(payload.photos),
                 sum(1 for a in payload.answers.values() if a=='MAL')))
             cn.execute('UPDATE vehicles SET odometer=MAX(odometer,?) WHERE id=?',(payload.odometer,payload.vehicle_id))
             cn.execute('COMMIT')
@@ -347,14 +496,50 @@ class MoveIn(BaseModel):
     notes:str=''
 
 
+def inventory_fingerprint(payload: BaseModel) -> str:
+    # Include model defaults so omitted/default fields have the same meaning.
+    content = json.dumps(payload.model_dump(mode='json'), sort_keys=True,
+                         separators=(',', ':'), ensure_ascii=False)
+    return hashlib.sha256(content.encode('utf-8')).hexdigest()
+
+
+def replay_inventory_operation(cn, operation_key: str, scope: str, request_hash: str):
+    previous = cn.execute('''SELECT scope,request_hash,response_json
+        FROM inventory_operations WHERE operation_key=?''', (operation_key,)).fetchone()
+    if previous is None:
+        return None
+    if previous['scope'] != scope or previous['request_hash'] != request_hash:
+        raise HTTPException(409, {
+            'code': 'idempotency_conflict',
+            'message': 'Esta clave de operación ya fue utilizada con datos diferentes. Conserva la clave y revisa la operación antes de volver a enviar.',
+        })
+    return json.loads(previous['response_json'])
+
+
+def record_inventory_operation(cn, operation_key: str, scope: str, request_hash: str, result: dict):
+    # Called within the SAME write transaction as stock/request updates. A failed
+    # insert or commit rolls back every effect; rejected operations retain no key.
+    cn.execute('''INSERT INTO inventory_operations(operation_key,scope,request_hash,response_json)
+        VALUES(?,?,?,?)''', (operation_key, scope, request_hash,
+        json.dumps(result, separators=(',', ':'), ensure_ascii=False)))
+
+
 @app.post('/api/movements')
-def create_movement(m: MoveIn):
-    if m.movement_type not in ('ENTRADA','SALIDA'):
-        raise HTTPException(422,'El movimiento debe ser ENTRADA o SALIDA.')
-    q=milli(m.quantity)
+def create_movement(m: MoveIn, idempotency_key: str = Header(
+        ..., alias='Idempotency-Key', min_length=1, max_length=128,
+        pattern=r'^[A-Za-z0-9._:-]+$')):
+    scope = 'movement'
+    request_hash = inventory_fingerprint(m)
     with connect() as cn:
         cn.execute('BEGIN IMMEDIATE')
         try:
+            previous = replay_inventory_operation(cn, idempotency_key, scope, request_hash)
+            if previous is not None:
+                cn.execute('COMMIT')
+                return previous
+            if m.movement_type not in ('ENTRADA','SALIDA'):
+                raise HTTPException(422,'El movimiento debe ser ENTRADA o SALIDA.')
+            q=milli(m.quantity)
             p=get_part(cn,m.part_id)
             if p['unit']=='unidad' and q%1000:
                 raise HTTPException(422,'Los repuestos contados por unidad requieren cantidades enteras.')
@@ -363,8 +548,10 @@ def create_movement(m: MoveIn):
                 raise HTTPException(409,'No hay existencias suficientes para esta salida.')
             cur=cn.execute('''INSERT INTO movements(part_id,movement_type,qty_milli,vehicle_id,reference,responsible,notes)
                 VALUES(?,?,?,?,?,?,?)''',(m.part_id,m.movement_type,q,m.vehicle_id,m.reference.strip(),required(m.responsible,'Responsable'),m.notes.strip()))
+            result = {'ok':True,'id':cur.lastrowid}
+            record_inventory_operation(cn, idempotency_key, scope, request_hash, result)
             cn.execute('COMMIT')
-            return {'ok':True,'id':cur.lastrowid}
+            return result
         except Exception:
             cn.execute('ROLLBACK')
             raise
@@ -374,19 +561,23 @@ class MaintenanceIn(BaseModel):
     vehicle_id:int
     service_name:str
     performed_on:str
-    odometer:int=Field(ge=0)
-    interval_km:int|None=Field(default=None,gt=0)
+    odometer:int=Field(strict=True,ge=0,le=MAX_ODOMETER_KM)
+    interval_km:int|None=Field(default=None,strict=True,gt=0,le=MAX_SERVICE_INTERVAL_KM)
     notes:str=''
 
 
 @app.post('/api/maintenance')
 def create_maintenance(m:MaintenanceIn):
+    service_name = required(m.service_name,'Servicio')
+    if service_key(service_name) == service_key(ODOMETER_CORRECTION_SERVICE):
+        raise HTTPException(422, 'Las correcciones de kilometraje deben registrarse mediante la acción explícita de corrección del vehículo.')
+    performed_on = service_date(m.performed_on)
     with connect() as cn:
         cn.execute('BEGIN IMMEDIATE')
         try:
             get_vehicle(cn,m.vehicle_id)
             cur=cn.execute('''INSERT INTO maintenance(vehicle_id,service_name,performed_on,odometer,interval_km,next_due_km,notes)
-                VALUES(?,?,?,?,?,?,?)''',(m.vehicle_id,required(m.service_name,'Servicio'),required(m.performed_on,'Fecha'),m.odometer,
+                VALUES(?,?,?,?,?,?,?)''',(m.vehicle_id,service_name,performed_on,m.odometer,
                 m.interval_km,m.odometer + m.interval_km if m.interval_km else None,m.notes.strip()))
             cn.execute('UPDATE vehicles SET odometer=MAX(odometer,?) WHERE id=?',(m.odometer,m.vehicle_id))
             cn.execute('COMMIT')
@@ -457,10 +648,18 @@ class DeliveryIn(BaseModel):
 
 
 @app.post('/api/requests/{request_id}/deliver')
-def deliver(request_id:int,payload:DeliveryIn):
+def deliver(request_id:int,payload:DeliveryIn, idempotency_key: str = Header(
+        ..., alias='Idempotency-Key', min_length=1, max_length=128,
+        pattern=r'^[A-Za-z0-9._:-]+$')):
+    scope = f'delivery:{request_id}'
+    request_hash = inventory_fingerprint(payload)
     with connect() as cn:
         cn.execute('BEGIN IMMEDIATE')
         try:
+            previous = replay_inventory_operation(cn, idempotency_key, scope, request_hash)
+            if previous is not None:
+                cn.execute('COMMIT')
+                return previous
             req=cn.execute('SELECT * FROM requests WHERE id=?',(request_id,)).fetchone()
             if not req:raise HTTPException(404,'Solicitud no encontrada.')
             if req['status'] not in ('APROBADA','PARCIAL'):
@@ -484,7 +683,9 @@ def deliver(request_id:int,payload:DeliveryIn):
                 cn.execute('UPDATE request_lines SET delivered_milli=delivered_milli+? WHERE id=?',(n,x.line_id))
             pending=cn.execute('''SELECT COUNT(*) FROM request_lines WHERE request_id=? AND delivered_milli<qty_milli''',(request_id,)).fetchone()[0]
             cn.execute('UPDATE requests SET status=?,received_by=? WHERE id=?',('PARCIAL' if pending else 'ENTREGADA',receiver,request_id))
-            cn.execute('COMMIT');return {'ok':True,'status':'PARCIAL' if pending else 'ENTREGADA'}
+            result = {'ok':True,'status':'PARCIAL' if pending else 'ENTREGADA'}
+            record_inventory_operation(cn, idempotency_key, scope, request_hash, result)
+            cn.execute('COMMIT');return result
         except Exception:
             cn.execute('ROLLBACK');raise
 

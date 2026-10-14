@@ -1,6 +1,7 @@
 import json
 import importlib
 from pathlib import Path
+from uuid import uuid4
 import pytest
 from fastapi.testclient import TestClient
 
@@ -25,7 +26,7 @@ def part(c,code='TEST-F1',unit='unidad'):
 
 
 def move(c,pid,kind,qty,**kw):
-    return c.post('/api/movements',json={'part_id':pid,'movement_type':kind,'quantity':qty,'responsible':'Bodega','reference':'PR-01',**kw})
+    return c.post('/api/movements',headers={'Idempotency-Key':str(uuid4())},json={'part_id':pid,'movement_type':kind,'quantity':qty,'responsible':'Bodega','reference':'PR-01',**kw})
 
 
 def test_home_and_manifest(client):
@@ -70,13 +71,13 @@ def test_request_approval_delivery_and_reject_insufficient(client):
     assert move(client,pid,'ENTRADA','3').status_code==200
     q=client.post('/api/requests',json={'vehicle_id':vid,'requester':'Mecánico','items':[{'part_id':pid,'quantity':'2'}]}).json()['id']
     assert client.get('/api/bootstrap').json()['parts'][0]['stock_milli']==3000
-    assert client.post(f'/api/requests/{q}/deliver',json={'received_by':'A','delivered_by':'B','lines':[{'line_id':1,'quantity':'2'}]}).status_code==409
+    assert client.post(f'/api/requests/{q}/deliver',headers={'Idempotency-Key':str(uuid4())},json={'received_by':'A','delivered_by':'B','lines':[{'line_id':1,'quantity':'2'}]}).status_code==409
     assert client.post(f'/api/requests/{q}/approve',json={'approved_by':'Jefe'}).status_code==200
     line=client.get(f'/api/requests/{q}').json()['lines'][0]['id']
-    assert client.post(f'/api/requests/{q}/deliver',json={'received_by':'A','delivered_by':'B','lines':[{'line_id':line,'quantity':'1'}]}).json()['status']=='PARCIAL'
-    assert client.post(f'/api/requests/{q}/deliver',json={'received_by':'A','delivered_by':'B','lines':[{'line_id':line,'quantity':'1'}]}).json()['status']=='ENTREGADA'
+    assert client.post(f'/api/requests/{q}/deliver',headers={'Idempotency-Key':str(uuid4())},json={'received_by':'A','delivered_by':'B','lines':[{'line_id':line,'quantity':'1'}]}).json()['status']=='PARCIAL'
+    assert client.post(f'/api/requests/{q}/deliver',headers={'Idempotency-Key':str(uuid4())},json={'received_by':'A','delivered_by':'B','lines':[{'line_id':line,'quantity':'1'}]}).json()['status']=='ENTREGADA'
     assert client.get('/api/bootstrap').json()['parts'][0]['stock_milli']==1000
-    assert client.post(f'/api/requests/{q}/deliver',json={'received_by':'A','delivered_by':'B','lines':[{'line_id':line,'quantity':'1'}]}).status_code==409
+    assert client.post(f'/api/requests/{q}/deliver',headers={'Idempotency-Key':str(uuid4())},json={'received_by':'A','delivered_by':'B','lines':[{'line_id':line,'quantity':'1'}]}).status_code==409
 
 
 def test_inspection_idempotent_and_checklist_only_liviano(client):
