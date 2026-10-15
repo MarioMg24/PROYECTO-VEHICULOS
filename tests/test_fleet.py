@@ -8,6 +8,7 @@ from fastapi.testclient import TestClient
 @pytest.fixture()
 def client(monkeypatch,tmp_path):
     import server
+    monkeypatch.setenv('GEFLEET_ALLOW_CREATE_DB', '1')
     monkeypatch.setattr(server,'DB',tmp_path/'test.db')
     with TestClient(server.app) as c:
         yield c

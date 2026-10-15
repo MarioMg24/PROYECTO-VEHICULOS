@@ -6,6 +6,7 @@ from fastapi.testclient import TestClient
 @pytest.fixture()
 def checklist_client(monkeypatch, tmp_path):
     database = tmp_path / 'checklist.db'
+    monkeypatch.setenv('GEFLEET_ALLOW_CREATE_DB', '1')
     monkeypatch.setenv('GEFLEET_DB', str(database))
     import server
     monkeypatch.setattr(server, 'DB', database)

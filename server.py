@@ -5,31 +5,47 @@ from __future__ import annotations
 
 import csv
 import base64
+import argparse
 from contextlib import contextmanager
 from datetime import datetime, date
 from decimal import Decimal, InvalidOperation
 from io import BytesIO, StringIO
 import hashlib
 import json
+import logging
 import os
 from pathlib import Path
 import re
 import sqlite3
+import sys
 from tempfile import TemporaryDirectory
-from typing import Any
+from typing import Any, Literal
 from uuid import uuid4
 
-from fastapi import FastAPI, Header, HTTPException, Request
+from fastapi import FastAPI, Header, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 ROOT = Path(__file__).resolve().parent
 DATA = ROOT / 'data'
-DB = Path(os.environ.get('GEFLEET_DB', str(DATA / 'fleet.db'))).resolve()
+
+
+def resolve_database_path(value):
+    if not str(value).strip():
+        raise RuntimeError('La ruta de la base no puede estar vacía. Revisa GEFLEET_DB.')
+    path = Path(value).expanduser()
+    if not path.is_absolute():
+        raise RuntimeError('La ruta de la base debe ser absoluta. Revisa GEFLEET_DB o --database.')
+    return path.resolve()
+
+
+# Validate when opening/starting rather than during import so a CLI
+# --database argument can explicitly correct an invalid environment value.
+DB = os.environ.get('GEFLEET_DB', str(DATA / 'fleet.db'))
 TEMPLATE = json.loads((ROOT / 'checklist_liviano.json').read_text(encoding='utf-8'))
 CHECK_IDS = {f'{gi}-{ii}' for gi, g in enumerate(TEMPLATE) for ii, _ in enumerate(g['items'])}
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 MAX_ODOMETER_KM = 10_000_000
 MAX_SERVICE_INTERVAL_KM = 1_000_000
 MAX_EXPECTED_ODOMETER_KM = 9_007_199_254_740_991
@@ -40,14 +56,20 @@ app.mount('/static', StaticFiles(directory=str(ROOT / 'static')), name='static')
 
 
 @contextmanager
-def connect():
-    DB.parent.mkdir(parents=True, exist_ok=True)
-    cn = sqlite3.connect(str(DB), timeout=15, isolation_level=None)
-    cn.row_factory = sqlite3.Row
-    cn.execute('PRAGMA foreign_keys=ON')
-    cn.execute('PRAGMA busy_timeout=15000')
-    cn.execute('PRAGMA journal_mode=WAL')
+def _open_database(path, mode='rw', wal=False):
+    # mode=rw is deliberate: an incorrect/deleted path must never look like an
+    # empty fleet. Creation is restricted to explicit database initialization.
+    path = resolve_database_path(path)
+    if not path.is_file():
+        raise RuntimeError(f'No existe la base de datos: {path}. Revisa GEFLEET_DB. '
+                           'Para una instalación nueva usa server.py db-init.')
+    cn = sqlite3.connect(path.as_uri() + f'?mode={mode}', uri=True, timeout=15, isolation_level=None)
     try:
+        cn.row_factory = sqlite3.Row
+        cn.execute('PRAGMA foreign_keys=ON')
+        cn.execute('PRAGMA busy_timeout=15000')
+        if wal:
+            cn.execute('PRAGMA journal_mode=WAL')
         yield cn
         cn.commit()
     except Exception:
@@ -57,11 +79,11 @@ def connect():
         cn.close()
 
 
-def init_db():
-    with connect() as cn:
-        if cn.execute('PRAGMA user_version').fetchone()[0] > SCHEMA_VERSION:
-            raise RuntimeError('La base de datos utiliza una versión de esquema más reciente que esta aplicación.')
-        cn.executescript('''
+def connect():
+    return _open_database(DB, wal=True)
+
+
+BASE_SCHEMA = '''
 CREATE TABLE IF NOT EXISTS vehicles (
  id INTEGER PRIMARY KEY, plate TEXT UNIQUE NOT NULL, name TEXT NOT NULL,
  vehicle_type TEXT NOT NULL DEFAULT 'POR_VERIFICAR',
@@ -113,29 +135,170 @@ CREATE TABLE IF NOT EXISTS request_lines (
  part_id INTEGER NOT NULL REFERENCES parts(id), qty_milli INTEGER NOT NULL CHECK(qty_milli > 0),
  delivered_milli INTEGER NOT NULL DEFAULT 0 CHECK(delivered_milli >= 0 AND delivered_milli <= qty_milli)
 );
-''')
-        # executescript commits implicitly. Start the additive migration separately
-        # so the table and its schema version are either both committed or neither.
-        cn.execute('BEGIN IMMEDIATE')
-        try:
-            if cn.execute('PRAGMA user_version').fetchone()[0] < 1:
-                cn.execute('''CREATE TABLE inventory_operations (
+'''
+
+BASE_TABLE_COLUMNS = {
+    'vehicles': 'id plate name vehicle_type model brand odometer notes active created_at',
+    'inspections': 'id client_uuid vehicle_id date inspector odometer answers_json observations photos_json failure_count created_at',
+    'parts': 'id code name part_number category unit min_milli notes created_at',
+    'compatibility': 'vehicle_id part_id notes',
+    'movements': 'id part_id movement_type qty_milli vehicle_id reference responsible notes created_at',
+    'maintenance': 'id vehicle_id service_name performed_on odometer interval_km next_due_km notes created_at',
+    'requests': 'id vehicle_id requester reason status approved_by received_by created_at',
+    'request_lines': 'id request_id part_id qty_milli delivered_milli',
+}
+INVENTORY_OPERATION_COLUMNS = 'operation_key scope request_hash response_json created_at'
+MAINTENANCE_DETAIL_COLUMNS = 'maintenance_type work_performed responsible location'
+BASE_FOREIGN_KEYS = {
+    'inspections': {('vehicle_id', 'vehicles', 'id')},
+    'compatibility': {('vehicle_id', 'vehicles', 'id'), ('part_id', 'parts', 'id')},
+    'movements': {('part_id', 'parts', 'id'), ('vehicle_id', 'vehicles', 'id')},
+    'maintenance': {('vehicle_id', 'vehicles', 'id')},
+    'requests': {('vehicle_id', 'vehicles', 'id')},
+    'request_lines': {('request_id', 'requests', 'id'), ('part_id', 'parts', 'id')},
+}
+
+
+def _migration_1(cn):
+    # Preserve the existing additive 0 -> 1 migration and every historical row.
+    cn.execute('''CREATE TABLE inventory_operations (
                     operation_key TEXT PRIMARY KEY NOT NULL CHECK(length(operation_key) BETWEEN 1 AND 128),
                     scope TEXT NOT NULL,
                     request_hash TEXT NOT NULL,
                     response_json TEXT NOT NULL,
                     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
                 )''')
-                cn.execute('PRAGMA user_version=1')
-            cn.execute('COMMIT')
-        except Exception:
+
+
+def _migration_2(cn):
+    # Add service details without rewriting notes or any historical record.
+    for column in MAINTENANCE_DETAIL_COLUMNS.split():
+        cn.execute(f"ALTER TABLE maintenance ADD COLUMN {column} TEXT NOT NULL DEFAULT ''")
+    cn.execute('''CREATE INDEX idx_maintenance_vehicle_date
+                  ON maintenance(vehicle_id,performed_on DESC,odometer DESC,id DESC)''')
+
+
+MIGRATIONS = {1: _migration_1, 2: _migration_2}
+
+
+def _validate_schema(cn, version):
+    if version < 0 or version > SCHEMA_VERSION:
+        raise RuntimeError('La base utiliza una versión de esquema no compatible con esta aplicación.')
+    expected = dict(BASE_TABLE_COLUMNS)
+    if version >= 1:
+        expected['inventory_operations'] = INVENTORY_OPERATION_COLUMNS
+    if version >= 2:
+        expected['maintenance'] += ' ' + MAINTENANCE_DETAIL_COLUMNS
+    tables = {r[0] for r in cn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    if version == 0 and 'inventory_operations' in tables:
+        raise RuntimeError('El esquema declara versión 0 pero contiene inventory_operations. '
+                           'Revisa la versión y el origen de la base antes de continuar.')
+    for table, names in expected.items():
+        if table not in tables:
+            raise RuntimeError(f'Esquema incompleto: falta la tabla {table}. No se modifica la base.')
+        columns = {r[1] for r in cn.execute(f'PRAGMA table_info("{table}")')}
+        if not set(names.split()) <= columns:
+            raise RuntimeError(f'Esquema incompatible en {table}: faltan columnas. No se modifica la base.')
+    for table, expected_keys in BASE_FOREIGN_KEYS.items():
+        keys = {(r[3], r[2], r[4]) for r in cn.execute(f'PRAGMA foreign_key_list("{table}")')}
+        if not expected_keys <= keys:
+            raise RuntimeError(f'Esquema incompatible en {table}: faltan claves foráneas.')
+    if version >= 1:
+        columns = {r[1]: r for r in cn.execute('PRAGMA table_info(inventory_operations)')}
+        primary_key = [name for name, column in columns.items() if column[5]]
+        if primary_key != ['operation_key'] or not columns['operation_key'][3]:
+            raise RuntimeError('inventory_operations no tiene la clave única requerida.')
+
+
+def validate_database(cn, require_current=True):
+    version = cn.execute('PRAGMA user_version').fetchone()[0]
+    _validate_schema(cn, version)
+    if require_current and version != SCHEMA_VERSION:
+        raise RuntimeError('La base necesita una migración antes de utilizarse.')
+    integrity = [r[0] for r in cn.execute('PRAGMA integrity_check')]
+    if integrity != ['ok']:
+        raise RuntimeError('La comprobación de integridad SQLite falló: ' + '; '.join(integrity))
+    foreign_keys = [tuple(r) for r in cn.execute('PRAGMA foreign_key_check')]
+    if foreign_keys:
+        raise RuntimeError(f'La base contiene {len(foreign_keys)} violaciones de claves foráneas.')
+    return version
+
+
+def _migration_authorizer(action, arg1, arg2, database, trigger):
+    # executescript() commits implicitly before running its script. Deny that
+    # commit, transaction control, and schema-version writes inside callbacks.
+    if action in (sqlite3.SQLITE_TRANSACTION, sqlite3.SQLITE_SAVEPOINT,
+                  sqlite3.SQLITE_ATTACH, sqlite3.SQLITE_DETACH):
+        return sqlite3.SQLITE_DENY
+    if action == sqlite3.SQLITE_PRAGMA and arg2 is not None:
+        if arg1.casefold() in ('user_version', 'foreign_keys', 'journal_mode', 'writable_schema'):
+            return sqlite3.SQLITE_DENY
+    return sqlite3.SQLITE_OK
+
+
+def apply_migrations(cn, initialize=False):
+    if cn.in_transaction:
+        raise RuntimeError('El ejecutor de migraciones requiere una conexión sin transacción activa.')
+    # Check the entire registry before the first write, including future gaps.
+    if set(MIGRATIONS) != set(range(1, SCHEMA_VERSION + 1)):
+        raise RuntimeError('Registro de migraciones incompleto: deben ser consecutivas desde la versión 1.')
+    cn.execute('BEGIN IMMEDIATE')
+    try:
+        version = cn.execute('PRAGMA user_version').fetchone()[0]
+        if initialize:
+            if version != 0 or cn.execute('SELECT 1 FROM sqlite_master LIMIT 1').fetchone():
+                raise RuntimeError('La inicialización requiere una base nueva y vacía.')
+            # This static schema has no triggers; execute each complete statement
+            # separately to keep schema creation inside the same transaction.
+            for statement in BASE_SCHEMA.split(';'):
+                if statement.strip():
+                    cn.execute(statement)
+        _validate_schema(cn, version)
+        for target in range(version + 1, SCHEMA_VERSION + 1):
+            cn.set_authorizer(_migration_authorizer)
+            try:
+                MIGRATIONS[target](cn)
+            finally:
+                cn.set_authorizer(None)
+            if not cn.in_transaction:
+                raise RuntimeError('Una migración cerró su transacción antes de terminar.')
+            cn.execute(f'PRAGMA user_version={target}')
+        validate_database(cn)
+        cn.execute('COMMIT')
+    except BaseException:
+        cn.set_authorizer(None)
+        if cn.in_transaction:
             cn.execute('ROLLBACK')
-            raise
+        raise
+
+
+def init_db(allow_create=None):
+    path = resolve_database_path(DB)
+    if allow_create is None:
+        allow_create = os.environ.get('GEFLEET_ALLOW_CREATE_DB') == '1'
+    if not path.exists():
+        if not allow_create:
+            raise RuntimeError(f'No existe la base de datos: {path}. Revisa GEFLEET_DB; '
+                               'para crear una base nueva ejecuta server.py db-init.')
+        if not path.parent.is_dir():
+            raise RuntimeError(f'La carpeta de la base no existe: {path.parent}. Créala explícitamente.')
+        # O_EXCL prevents a concurrent initializer from overwriting an existing
+        # file. A failed initialization may leave an empty file for inspection.
+        descriptor = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        os.close(descriptor)
+        with _open_database(path) as cn:
+            apply_migrations(cn, initialize=True)
+            cn.execute('PRAGMA journal_mode=WAL')
+    else:
+        with _open_database(path) as cn:
+            apply_migrations(cn)
+            cn.execute('PRAGMA journal_mode=WAL')
 
 
 @app.on_event('startup')
 def _startup():
     init_db()
+    logging.getLogger('uvicorn.error').info('Base SQLite activa: %s; esquema: %s', resolve_database_path(DB), SCHEMA_VERSION)
 
 
 def rows(query, args=()):
@@ -211,7 +374,7 @@ def current_maintenance_plans(cn):
     ranks = {}
     for row in cn.execute('''SELECT m.*,v.name AS vehicle_name,v.plate
             FROM maintenance m JOIN vehicles v ON v.id=m.vehicle_id
-            WHERE m.interval_km>0'''):
+            WHERE m.interval_km>0 AND m.maintenance_type<>'CORRECTIVO' '''):
         record = dict(row)
         try:
             performed_on = service_date(record['performed_on'])
@@ -558,12 +721,16 @@ def create_movement(m: MoveIn, idempotency_key: str = Header(
 
 
 class MaintenanceIn(BaseModel):
-    vehicle_id:int
-    service_name:str
+    vehicle_id:int=Field(strict=True,gt=0,le=MAX_EXPECTED_ODOMETER_KM)
+    service_name:str=Field(max_length=250)
     performed_on:str
     odometer:int=Field(strict=True,ge=0,le=MAX_ODOMETER_KM)
     interval_km:int|None=Field(default=None,strict=True,gt=0,le=MAX_SERVICE_INTERVAL_KM)
-    notes:str=''
+    notes:str=Field(default='',max_length=4000)
+    maintenance_type:Literal['','MPG','CORRECTIVO']=''
+    work_performed:str=Field(default='',max_length=4000)
+    responsible:str=Field(default='',max_length=150)
+    location:str=Field(default='',max_length=150)
 
 
 @app.post('/api/maintenance')
@@ -571,20 +738,96 @@ def create_maintenance(m:MaintenanceIn):
     service_name = required(m.service_name,'Servicio')
     if service_key(service_name) == service_key(ODOMETER_CORRECTION_SERVICE):
         raise HTTPException(422, 'Las correcciones de kilometraje deben registrarse mediante la acción explícita de corrección del vehículo.')
+    if m.maintenance_type == 'CORRECTIVO' and m.interval_km is not None:
+        raise HTTPException(422, 'Un mantenimiento correctivo no puede reiniciar un plan preventivo. Deja vacío el intervalo.')
     performed_on = service_date(m.performed_on)
     with connect() as cn:
         cn.execute('BEGIN IMMEDIATE')
         try:
             get_vehicle(cn,m.vehicle_id)
-            cur=cn.execute('''INSERT INTO maintenance(vehicle_id,service_name,performed_on,odometer,interval_km,next_due_km,notes)
-                VALUES(?,?,?,?,?,?,?)''',(m.vehicle_id,service_name,performed_on,m.odometer,
-                m.interval_km,m.odometer + m.interval_km if m.interval_km else None,m.notes.strip()))
+            cur=cn.execute('''INSERT INTO maintenance(vehicle_id,service_name,performed_on,odometer,interval_km,next_due_km,
+                notes,maintenance_type,work_performed,responsible,location)
+                VALUES(?,?,?,?,?,?,?,?,?,?,?)''',(m.vehicle_id,service_name,performed_on,m.odometer,
+                m.interval_km,m.odometer + m.interval_km if m.interval_km else None,m.notes.strip(),
+                m.maintenance_type,m.work_performed.strip(),m.responsible.strip(),m.location.strip()))
             cn.execute('UPDATE vehicles SET odometer=MAX(odometer,?) WHERE id=?',(m.odometer,m.vehicle_id))
             cn.execute('COMMIT')
             return {'ok':True,'id':cur.lastrowid}
         except Exception:
             cn.execute('ROLLBACK')
             raise
+
+
+@app.get('/api/maintenance')
+def maintenance_history(
+        vehicle_id:int|None=Query(default=None,gt=0,le=MAX_EXPECTED_ODOMETER_KM),
+        date_from:str|None=None,
+        date_to:str|None=None,
+        maintenance_type:Literal['MPG','CORRECTIVO','LEGACY']|None=None,
+        page:int=Query(default=1,ge=1,le=2_147_483_647),
+        page_size:int=Query(default=20,ge=1,le=100)):
+    start = service_date(date_from) if date_from is not None else None
+    end = service_date(date_to) if date_to is not None else None
+    if start is not None and end is not None and start > end:
+        raise HTTPException(422, 'La fecha inicial no puede ser posterior a la fecha final.')
+    conditions, values = [], []
+    if vehicle_id is not None:
+        conditions.append('m.vehicle_id=?')
+        values.append(vehicle_id)
+    if start is not None:
+        conditions.append('m.performed_on>=?')
+        values.append(start)
+    if end is not None:
+        conditions.append('m.performed_on<=?')
+        values.append(end)
+    if maintenance_type is not None:
+        conditions.append('m.maintenance_type=?')
+        values.append('' if maintenance_type == 'LEGACY' else maintenance_type)
+    where = ' WHERE ' + ' AND '.join(conditions) if conditions else ''
+    joined = ' FROM maintenance m JOIN vehicles v ON v.id=m.vehicle_id'
+    order = ' ORDER BY m.performed_on DESC,m.odometer DESC,m.id DESC'
+    with connect() as cn:
+        # Count, page, and current plans are one consistent read snapshot.
+        cn.execute('BEGIN')
+        if vehicle_id is not None:
+            get_vehicle(cn, vehicle_id)
+        total = cn.execute('SELECT COUNT(*)' + joined + where, values).fetchone()[0]
+        items = [dict(row) for row in cn.execute(
+            'SELECT m.*,v.name AS vehicle_name,v.plate' + joined + where + order + ' LIMIT ? OFFSET ?',
+            [*values, page_size, (page - 1) * page_size])]
+        latest_where = ' WHERE m.vehicle_id=?' if vehicle_id is not None else ''
+        latest_values = (vehicle_id,) if vehicle_id is not None else ()
+        latest = None
+        for record in cn.execute('SELECT m.*,v.name AS vehicle_name,v.plate' + joined + latest_where + order,
+                                 latest_values):
+            if service_key(record['service_name']) == service_key(ODOMETER_CORRECTION_SERVICE):
+                continue
+            try:
+                service_date(record['performed_on'])
+            except HTTPException:
+                continue
+            latest = dict(record)
+            break
+        plans = current_maintenance_plans(cn)
+        if vehicle_id is not None:
+            plans = [plan for plan in plans if plan['vehicle_id'] == vehicle_id]
+        current_odometer = {vehicle['id']: vehicle['odometer']
+                            for vehicle in cn.execute('SELECT id,odometer FROM vehicles')}
+        plans = [{**plan, 'current_odometer':current_odometer[plan['vehicle_id']]}
+                 for plan in plans]
+    return {'items':items,'total':total,'page':page,'page_size':page_size,
+            'pages':(total + page_size - 1) // page_size,'latest':latest,'plans':plans}
+
+
+@app.get('/api/maintenance/{maintenance_id}')
+def maintenance_detail(maintenance_id:int):
+    if not 1 <= maintenance_id <= MAX_EXPECTED_ODOMETER_KM:
+        raise HTTPException(422, 'El identificador del mantenimiento está fuera de rango.')
+    record = row('''SELECT m.*,v.name AS vehicle_name,v.plate FROM maintenance m
+                    JOIN vehicles v ON v.id=m.vehicle_id WHERE m.id=?''', (maintenance_id,))
+    if record is None:
+        raise HTTPException(404, 'Mantenimiento no encontrado.')
+    return record
 
 
 class RequestItem(BaseModel):
@@ -723,31 +966,157 @@ def export_csv(what:str):
         r=rows('''SELECT m.created_at,p.code,p.name,m.movement_type,m.qty_milli,p.unit,COALESCE(v.plate,''),m.reference,m.responsible FROM movements m JOIN parts p ON p.id=m.part_id LEFT JOIN vehicles v ON v.id=m.vehicle_id ORDER BY m.id''')
         return make_csv(['Fecha','Código','Repuesto','Tipo','Cantidad (milésimas)','Unidad','Placa destino','Documento','Responsable'],[x.values() for x in r],'movimientos.csv')
     if what=='maintenance':
-        r=rows('''SELECT m.performed_on,v.plate,m.service_name,m.odometer,m.interval_km,m.next_due_km,m.notes FROM maintenance m JOIN vehicles v ON v.id=m.vehicle_id ORDER BY m.id''')
-        return make_csv(['Fecha','Placa','Servicio','Km','Intervalo km','Próximo km','Notas'],[x.values() for x in r],'mantenimientos.csv')
+        r=rows('''SELECT m.performed_on,v.plate,m.service_name,m.maintenance_type,m.work_performed,
+            m.odometer,m.interval_km,m.next_due_km,m.responsible,m.location,m.notes
+            FROM maintenance m JOIN vehicles v ON v.id=m.vehicle_id
+            ORDER BY m.performed_on DESC,m.odometer DESC,m.id DESC''')
+        return make_csv(['Fecha','Placa','Servicio','Tipo de mantenimiento','Trabajo realizado','Km',
+                         'Intervalo km','Próximo km','Responsable','Lugar','Observaciones'],
+                        [x.values() for x in r],'mantenimientos.csv')
     raise HTTPException(404,'Exportación no disponible.')
 
 
 @app.get('/api/backup')
 def backup():
-    with connect() as cn:
-        tmp=sqlite3.connect(':memory:')
-        try:
-            cn.backup(tmp)
-            # Serialize snapshot using a temporary file; only for trusted local prototype usage.
-            with TemporaryDirectory() as folder:
-                path=Path(folder)/'snapshot.db'
-                file_db=sqlite3.connect(str(path))
-                try:
-                    tmp.backup(file_db)
-                finally:
-                    file_db.close()
-                data=path.read_bytes()
-        finally:tmp.close()
+    with TemporaryDirectory() as folder:
+        path = Path(folder) / 'snapshot.db'
+        create_backup(path)
+        data = path.read_bytes()
     filename=f'goldengine_fleet_{datetime.now().strftime("%Y%m%d_%H%M%S")}.db'
     return Response(data,media_type='application/octet-stream',headers={'Content-Disposition':f'attachment; filename="{filename}"'})
 
 
 @app.get('/api/health')
 def health():
-    return {'ok':True,'prototype':True}
+    with _open_database(DB, mode='ro') as cn:
+        version = cn.execute('PRAGMA user_version').fetchone()[0]
+    return {'ok':True,'prototype':True,'database':str(resolve_database_path(DB)),
+            'schema_version':version}
+
+
+def database_info(path=None):
+    path = resolve_database_path(DB if path is None else path)
+    with _open_database(path, mode='ro') as cn:
+        cn.execute('BEGIN')
+        version = validate_database(cn, require_current=False)
+        tables = dict(BASE_TABLE_COLUMNS)
+        if version >= 1:
+            tables['inventory_operations'] = INVENTORY_OPERATION_COLUMNS
+        counts = {name: cn.execute(f'SELECT COUNT(*) FROM "{name}"').fetchone()[0] for name in tables}
+        balances = [dict(row) for row in cn.execute('''SELECT p.id AS part_id,p.code,
+            COALESCE(SUM(CASE m.movement_type WHEN 'ENTRADA' THEN m.qty_milli
+                        WHEN 'SALIDA' THEN -m.qty_milli ELSE 0 END),0) AS stock_milli
+            FROM parts p LEFT JOIN movements m ON m.part_id=p.id
+            GROUP BY p.id,p.code ORDER BY p.id''')]
+        return {'database':str(path), 'schema_version':version,
+                'journal_mode':cn.execute('PRAGMA journal_mode').fetchone()[0],
+                'sqlite_version':sqlite3.sqlite_version,
+                'integrity_check':'ok', 'foreign_key_check':[], 'tables':counts,
+                'stock_milli':balances}
+
+
+def _check_new_destination(destination):
+    destination = resolve_database_path(destination)
+    if not destination.parent.is_dir():
+        raise RuntimeError(f'La carpeta de destino no existe: {destination.parent}. Créala explícitamente.')
+    # Reject dangling symlinks and orphan WAL/SHM files as well as existing DBs.
+    if os.path.lexists(destination) or any(os.path.lexists(str(destination) + suffix) for suffix in ('-wal', '-shm', '-journal')):
+        raise RuntimeError(f'El destino ya existe o tiene archivos SQLite auxiliares: {destination}. '
+                           'No se sobrescribe; elige un nombre nuevo.')
+    return destination
+
+
+def _write_snapshot(source, destination, require_current=False):
+    destination = _check_new_destination(destination)
+    # Same-directory staging and a hard-link publication preserve atomicity on
+    # Windows/Linux without the overwrite behavior of rename/replace.
+    with TemporaryDirectory(prefix='.gefleet-snapshot-', dir=str(destination.parent)) as folder:
+        staging = Path(folder) / 'snapshot.db'
+        snapshot = sqlite3.connect(str(staging), isolation_level=None)
+        try:
+            source.backup(snapshot)
+            snapshot.execute('PRAGMA foreign_keys=ON')
+            snapshot.execute('PRAGMA journal_mode=DELETE')
+            validate_database(snapshot, require_current=require_current)
+        finally:
+            snapshot.close()
+        with staging.open('rb+') as file:
+            os.fsync(file.fileno())
+        # os.link fails if another process created destination meanwhile. It
+        # never replaces a database, and all SQLite handles are already closed.
+        _check_new_destination(destination)
+        os.link(staging, destination)
+    return database_info(destination)
+
+
+def create_backup(destination, database=None):
+    source_path = resolve_database_path(DB if database is None else database)
+    destination = _check_new_destination(destination)
+    if source_path == destination:
+        raise RuntimeError('El respaldo debe guardarse en una ruta diferente de la base original.')
+    # SQLite's backup API reads a consistent committed snapshot, including WAL
+    # transactions. Never copy just the active database file with read_bytes().
+    with _open_database(source_path, mode='ro') as source:
+        return _write_snapshot(source, destination)
+
+
+def restore_backup(source, destination):
+    source_path = resolve_database_path(source)
+    destination = resolve_database_path(destination)
+    if destination == (DATA / 'fleet.db').resolve():
+        raise RuntimeError('La restauración no puede reemplazar ni crear data/fleet.db. '
+                           'Usa una ubicación nueva y verificada con el servidor detenido.')
+    destination = _check_new_destination(destination)
+    if not source_path.is_file():
+        raise RuntimeError(f'No existe el archivo de respaldo: {source_path}.')
+    if any(os.path.lexists(str(source_path) + suffix) for suffix in ('-wal', '-shm', '-journal')):
+        raise RuntimeError('El origen tiene archivos SQLite auxiliares. Restaura un respaldo '
+                           'independiente creado con /api/backup o db-backup.')
+    with source_path.open('rb') as file:
+        header = file.read(100)
+    if len(header) < 100 or not header.startswith(b'SQLite format 3\x00'):
+        raise RuntimeError('El respaldo no es un archivo SQLite válido.')
+    if header[18:20] != b'\x01\x01':
+        raise RuntimeError('El respaldo usa formato WAL. Genera un respaldo independiente con '
+                           '/api/backup o db-backup antes de restaurar.')
+    # No schema migration during restoration: version and historical values are
+    # preserved exactly; normal startup applies supported migrations afterward.
+    with _open_database(source_path, mode='ro') as source_db:
+        validate_database(source_db, require_current=False)
+        return _write_snapshot(source_db, destination)
+
+
+def _database_cli():
+    parser = argparse.ArgumentParser(description='Gestión local segura de la base Gold Engine Fleet.')
+    subparsers = parser.add_subparsers(dest='command', required=True)
+    for name in ('db-info', 'db-init', 'db-backup'):
+        command = subparsers.add_parser(name)
+        command.add_argument('--database', help='Ruta absoluta; prevalece sobre GEFLEET_DB.')
+        if name == 'db-backup':
+            command.add_argument('--destination', required=True, help='Ruta absoluta de un archivo nuevo.')
+    command = subparsers.add_parser('db-restore', help='Restaurar en un archivo NUEVO con el servidor detenido.')
+    command.add_argument('--source', required=True, help='Respaldo SQLite independiente.')
+    command.add_argument('--destination', required=True, help='Ruta absoluta nueva; nunca se sobrescribe.')
+    args = parser.parse_args()
+    global DB
+    try:
+        if getattr(args, 'database', None) is not None:
+            DB = resolve_database_path(args.database)
+        if args.command == 'db-info':
+            result = database_info()
+        elif args.command == 'db-init':
+            init_db(allow_create=True)
+            result = database_info()
+        elif args.command == 'db-backup':
+            result = create_backup(args.destination)
+        else:
+            result = restore_backup(args.source, args.destination)
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        return 0
+    except (RuntimeError, sqlite3.Error, OSError) as error:
+        print(f'ERROR: {error}', file=sys.stderr)
+        return 1
+
+
+if __name__ == '__main__':
+    sys.exit(_database_cli())

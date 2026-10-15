@@ -105,7 +105,7 @@ test('Inventory idempotency browser regressions with isolated SQLite and profile
   let serverLog = '', browser, cdp;
   const server = spawn(python, ['-B', '-m', 'uvicorn', 'server:app', '--host', '127.0.0.1', '--port', String(serverPort)], {
     cwd: root, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'],
-    env: {...process.env, GEFLEET_DB: join(temporary, 'inventory.db'), PYTHONDONTWRITEBYTECODE: '1'},
+    env: {...process.env, GEFLEET_DB: join(temporary, 'inventory.db'), GEFLEET_ALLOW_CREATE_DB: '1', PYTHONDONTWRITEBYTECODE: '1'},
   });
   server.stdout.on('data', data => { serverLog += data; });
   server.stderr.on('data', data => { serverLog += data; });

@@ -107,7 +107,7 @@ test('Checklist browser regressions with isolated SQLite and profile', {timeout:
   let cdp;
   const server = spawn(python, ['-B', '-m', 'uvicorn', 'server:app', '--host', '127.0.0.1', '--port', String(serverPort)], {
     cwd: root, windowsHide: true,
-    env: {...process.env, GEFLEET_DB: join(temporary, 'checklist.db'), PYTHONDONTWRITEBYTECODE: '1'},
+    env: {...process.env, GEFLEET_DB: join(temporary, 'checklist.db'), GEFLEET_ALLOW_CREATE_DB: '1', PYTHONDONTWRITEBYTECODE: '1'},
     stdio: ['ignore', 'pipe', 'pipe'],
   });
   server.stdout.on('data', data => { serverLog += data; });

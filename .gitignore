@@ -1,4 +1,5 @@
 .venv/
+.venv-sqlite-fixed/
 __pycache__/
 .pytest_cache/
 data/*.db

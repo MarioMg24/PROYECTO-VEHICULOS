@@ -14,6 +14,7 @@ from fastapi.testclient import TestClient
 def mileage_client(monkeypatch, tmp_path):
     import server
 
+    monkeypatch.setenv('GEFLEET_ALLOW_CREATE_DB', '1')
     monkeypatch.setenv('GEFLEET_DB', str(tmp_path / 'mileage.db'))
     monkeypatch.setattr(server, 'DB', tmp_path / 'mileage.db')
     with TestClient(server.app) as client:
@@ -50,10 +51,14 @@ def read_vehicle(client, vehicle_id):
 def frontend_eval(snapshot, expression='latestDue()'):
     """Run the real frontend functions against API state without browser side effects."""
     app_path = Path(__file__).resolve().parents[1] / 'static' / 'app.js'
-    script = """const fs = require('node:fs');
+    script = r"""const fs = require('node:fs');
 const vm = require('node:vm');
 const data = JSON.parse(fs.readFileSync(0, 'utf8'));
-const source = fs.readFileSync(data.path, 'utf8').split('function renderParts()')[0];
+const full = fs.readFileSync(data.path, 'utf8');
+// Maintenance now renders filters with the existing pure field helpers.
+// Include their real definitions without executing browser event handlers.
+const fields = full.match(/^function (?:f|s|area)\(.*$/gm) || [];
+const source = full.split('function renderParts()')[0] + '\n' + fields.join('\n');
 const context = vm.createContext({console});
 vm.runInContext(source, context);
 vm.runInContext('state = '+JSON.stringify(data.snapshot), context);

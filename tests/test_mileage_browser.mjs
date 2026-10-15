@@ -105,7 +105,7 @@ test('Mileage and maintenance browser regressions with isolated SQLite and profi
   let serverLog='',browser,cdp,fixtureNumber=0;
   const server=spawn(python,['-B','-m','uvicorn','server:app','--host','127.0.0.1','--port',String(serverPort)],{
     cwd:root,windowsHide:true,stdio:['ignore','pipe','pipe'],
-    env:{...process.env,GEFLEET_DB:join(temporary,'mileage.db'),PYTHONDONTWRITEBYTECODE:'1'},
+    env:{...process.env,GEFLEET_DB:join(temporary,'mileage.db'),GEFLEET_ALLOW_CREATE_DB:'1',PYTHONDONTWRITEBYTECODE:'1'},
   });
   server.stdout.on('data',d=>{serverLog+=d});server.stderr.on('data',d=>{serverLog+=d});
   try {

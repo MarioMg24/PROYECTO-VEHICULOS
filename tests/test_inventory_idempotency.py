@@ -12,6 +12,7 @@ from fastapi.testclient import TestClient
 def inventory_client(monkeypatch, tmp_path):
     import server
 
+    monkeypatch.setenv('GEFLEET_ALLOW_CREATE_DB', '1')
     monkeypatch.setenv('GEFLEET_DB', str(tmp_path / 'inventory.db'))
     monkeypatch.setattr(server, 'DB', tmp_path / 'inventory.db')
     with TestClient(server.app) as client:
@@ -444,7 +445,7 @@ def test_unique_database_key_prevents_duplicate_operation_records(inventory_clie
     assert operation_count(key) == 1
 
 
-def test_migration_from_version_zero_preserves_history_and_is_repeatable(inventory_client):
+def test_migration_from_version_zero_preserves_history_and_is_repeatable(inventory_client, monkeypatch, tmp_path):
     import server
 
     client = inventory_client
@@ -455,21 +456,33 @@ def test_migration_from_version_zero_preserves_history_and_is_repeatable(invento
     business_tables = ['vehicles', 'parts', 'compatibility', 'movements',
                        'requests', 'request_lines', 'inspections', 'maintenance']
     with sqlite3.connect(server.DB) as connection:
-        # The previous schema has the same business tables, no operation table
-        # and user_version=0. No historical row is altered to build this fixture.
-        connection.execute('DROP TABLE inventory_operations')
-        connection.execute('PRAGMA user_version=0')
-        before = {table: connection.execute(f'SELECT * FROM {table} ORDER BY rowid').fetchall()
+        before = {table: connection.execute(
+            f"SELECT {','.join(server.BASE_TABLE_COLUMNS[table].split())} FROM {table} ORDER BY rowid"
+        ).fetchall()
                   for table in business_tables}
     before_stock = client.get('/api/bootstrap').json()['parts'][0]['stock_milli']
     before_csv = client.get('/api/export/movements').content
+    # Build a true version-0 copy without altering the original temporary DB.
+    # The maintenance extension now has a separate version-2 migration.
+    legacy = tmp_path / 'legacy-inventory.db'
+    with sqlite3.connect(legacy) as connection:
+        connection.executescript(server.BASE_SCHEMA)
+        for table in business_tables:
+            columns = server.BASE_TABLE_COLUMNS[table].split()
+            connection.executemany(
+                f"INSERT INTO {table}({','.join(columns)}) VALUES({','.join('?' for _ in columns)})",
+                before[table],
+            )
+    monkeypatch.setattr(server, 'DB', legacy)
     for _ in range(2):
         server.init_db()
         with sqlite3.connect(server.DB) as connection:
-            after = {table: connection.execute(f'SELECT * FROM {table} ORDER BY rowid').fetchall()
+            after = {table: connection.execute(
+                f"SELECT {','.join(server.BASE_TABLE_COLUMNS[table].split())} FROM {table} ORDER BY rowid"
+            ).fetchall()
                      for table in business_tables}
             assert after == before
-            assert connection.execute('PRAGMA user_version').fetchone()[0] == 1
+            assert connection.execute('PRAGMA user_version').fetchone()[0] == server.SCHEMA_VERSION
             assert connection.execute('PRAGMA integrity_check').fetchone()[0] == 'ok'
             assert connection.execute('PRAGMA foreign_key_check').fetchall() == []
             assert connection.execute('SELECT COUNT(*) FROM inventory_operations').fetchone()[0] == 0
